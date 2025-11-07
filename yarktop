@@ -1,0 +1,573 @@
+#!/usr/bin/env python3
+#
+# yarktop - Yet Another Rockchip `top`-like Tool
+# Copyright (C) 2025  Emmanuel Cortes. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+import contextlib
+import math
+import os
+import queue
+import re
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+
+import psutil
+from rich import box
+from rich.console import Group
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, TextColumn
+from rich.table import Table
+
+PREV_DISK = None
+PREV_NET = None
+PREV_TIME = None
+
+
+def get_key(q):
+    old = termios.tcgetattr(sys.stdin)
+    tty.setcbreak(sys.stdin.fileno())
+    try:
+        while True:
+            b = os.read(sys.stdin.fileno(), 3).decode()
+            k = ord(b[2]) if len(b) == 3 else ord(b)
+            keymap = {
+                127: "backspace",
+                10: "return",
+                32: "space",
+                9: "tab",
+                27: "esc",
+                65: "up",
+                66: "down",
+                67: "right",
+                68: "left",
+            }
+            q.put(keymap.get(k, chr(k)))
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+
+
+def human_bytes(val):
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if val < 1024:
+            return f"{val:.1f} {unit}"
+        val /= 1024
+    return f"{val:.1f} PB"
+
+
+def get_gpu_usage():
+    """Read GPU utilization file and calculate usage percentage."""
+    try:
+        with open("/sys/kernel/debug/mali0/dvfs_utilization", "r") as f:
+            line = f.readline()
+            # Extract busy_time and idle_time values
+            parts = line.strip().split()
+            times = {
+                parts[i].rstrip(":"): int(parts[i + 1]) for i in range(0, len(parts), 2)
+            }
+            busy_time = times.get("busy_time", 0.11)
+            idle_time = times.get("idle_time", 0.11)
+            total_time = busy_time + idle_time
+            if total_time == 0:
+                return 0.0
+            gpu_usage = (busy_time / total_time) * 100
+            return gpu_usage
+    except Exception:
+        return None  # Return None if GPU not available
+
+
+def get_cpu_frequencies():
+    """Read current frequency for each CPU core in MHz."""
+    freqs = []
+    cpu_id = 0
+    while True:
+        freq_path = f"/sys/devices/system/cpu/cpu{cpu_id}/cpufreq/scaling_cur_freq"
+        try:
+            with open(freq_path, "r") as f:
+                freq_khz = int(f.read().strip())
+                freqs.append(freq_khz // 1000)  # Convert to MHz
+            cpu_id += 1
+        except Exception:
+            break
+    return freqs
+
+
+def get_gpu_frequency():
+    """Read GPU frequency in MHz."""
+    gpu_paths = [
+        "/sys/devices/platform/fb000000.gpu-panthor/devfreq/fb000000.gpu-panthor/cur_freq",
+        "/sys/class/devfreq/fb000000.gpu/cur_freq",
+    ]
+    for path in gpu_paths:
+        try:
+            with open(path, "r") as f:
+                freq_hz = int(f.read().strip())
+                return freq_hz // 1_000_000  # Convert to MHz
+        except Exception:
+            continue
+    return None
+
+
+def get_npu_frequency():
+    """Read NPU frequency in MHz."""
+    try:
+        with open("/sys/class/devfreq/fdab0000.npu/cur_freq", "r") as f:
+            freq_hz = int(f.read().strip())
+            return freq_hz // 1_000_000  # Convert to MHz
+    except Exception:
+        return None
+
+
+def get_npu_load():
+    try:
+        with open("/sys/kernel/debug/rknpu/load") as f:
+            text = f.read()
+        items = re.findall(r"Core(\d+):\s*(\d+)%", text)
+        return [int(pct) for _, pct in items]
+    except Exception:
+        return []
+
+
+def get_rga_load():
+    """
+    Read RGA (Rockchip Graphics Accelerator) load from debugfs.
+    Returns tuple of (num_schedulers, dict of {scheduler_name: load_percentage})
+    """
+    rgaload = {}
+    scheduler_id = 0
+    with contextlib.suppress(Exception):
+        with open("/sys/kernel/debug/rkrga/load", "r") as f:
+            lines = f.readlines()
+            csched = ""
+            for line in lines:
+                if "-" in line or "= load =" in line:
+                    continue
+                line = line.strip()
+                if line.startswith("num of scheduler ="):
+                    scheduler_id = int(line.split("=")[1])
+                elif line.startswith("scheduler"):
+                    csched = line.split(":")[1].strip()
+                elif line.startswith("load ="):
+                    load_percentage = line.split("=")[1].replace("%", "").strip()
+                    rgaload[csched] = float(load_percentage)
+    return scheduler_id, rgaload
+
+
+def get_rk_model():
+    """
+    Detect the Rockchip SoC model by reading the device tree.
+    Returns something like "RK3588" or "RK3399" if available,
+    or "Unknown RK" otherwise.
+    """
+    paths = ["/proc/device-tree/model", "/sys/firmware/devicetree/base/model"]
+    for p in paths:
+        if os.path.exists(p):
+            with contextlib.suppress(Exception):
+                # The file usually contains a NUL-terminated string
+                data = open(p, "rb").read().rstrip(b"\x00")
+                model = data.decode("ascii", errors="ignore")
+                # Look for something like "RKxxxx"
+                m = re.search(r"\b(RK\d+)\b", model, re.IGNORECASE)
+                if m:
+                    return m.group(1).upper()
+                return model
+    return "Unknown RK"
+
+
+def get_rga_version():
+    """Read RGA driver version"""
+    rgaver = ""
+    try:
+        with open("/sys/kernel/debug/rkrga/driver_version", "r") as f:
+            rgaver = f.read()
+        return rgaver.split(":")[1].strip()
+    except Exception:
+        return "Unknown"
+
+
+def get_npu_driver_version():
+    """Read NPU kernel driver version"""
+    try:
+        with open("/sys/kernel/debug/rknpu/version", "r") as f:
+            rkver = f.read()
+        return rkver.split(":")[1].strip()
+    except Exception:
+        return "Unknown"
+
+
+def get_librknnrt_version():
+    """Read librknnrt library version"""
+    try:
+        output = subprocess.check_output(
+            'strings /usr/lib/librknnrt.so | grep "librknnrt version:"', shell=True
+        )
+        ver = output.decode("utf-8").strip()
+        ver = ver.replace("librknnrt version: ", "")
+        ver = re.sub(r"\s*\(.*\)$", "", ver)
+        return ver
+    except Exception:
+        return "Unknown"
+
+
+def get_cpu_load():
+    return psutil.cpu_percent(percpu=True)
+
+
+def get_mem_info():
+    vm = psutil.virtual_memory()
+    sm = psutil.swap_memory()
+    return vm, sm
+
+
+def get_thermal():
+    temps = []
+    with contextlib.suppress(Exception):
+        for name, entries in psutil.sensors_temperatures().items():
+            if not entries or entries[0].current is None:
+                continue
+            label = name.replace("_thermal", "")
+            temps.append((label, math.floor(entries[0].current)))
+    return temps
+
+
+def get_top_processes(by="cpu", count=5):
+    """Obtains the top processes by CPU or memory usage.
+
+    Args:
+        by (str, optional): 'cpu' or 'memory' to sort by. Defaults to "cpu".
+        count (int, optional): number of processes to return. Defaults to 5.
+
+    Returns:
+        list: List of dictionaries with process information.
+    """
+    processes = []
+    for proc in psutil.process_iter(attrs=["pid", "name", "username"]):
+        try:
+            with proc.oneshot():
+                cpu = proc.cpu_percent(interval=None)
+                mem = proc.memory_percent()
+                info = {
+                    "pid": proc.pid,
+                    "name": proc.name(),
+                    "user": proc.username(),
+                    "cpu": cpu,
+                    "mem": mem,
+                }
+                processes.append(info)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    key = "cpu" if by == "cpu" else "mem"
+    return sorted(processes, key=lambda p: p[key], reverse=True)[:count]
+
+
+def build_process_panel():
+    """
+    Build a panel showing processes with highest CPU or memory usage.
+    """
+    top_cpu = get_top_processes(by="cpu", count=16)
+
+    table = Table(title="Top Processes", box=box.ROUNDED, expand=True, padding=(0, 1))
+    table.add_column("PID", style="cyan", justify="right", width=4)
+    table.add_column("User", style="white", width=6)
+    table.add_column("Name", style="green", width=40)
+    table.add_column("CPU%", justify="right", width=3)
+    table.add_column("Mem%", justify="right", width=3)
+
+    def is_root(username):
+        return username == "root" or username == "0"
+
+    for proc in top_cpu:
+        table.add_row(
+            str(proc["pid"]),
+            f"[dim]{proc['user']}" if is_root(proc["user"]) else proc["user"],
+            proc["name"],
+            f"{proc['cpu']:.1f}",
+            f"{proc['mem']:.1f}",
+        )
+
+    return table
+
+
+def build_gpu_panel():
+    """Build GPU panel for rktop with progress bar."""
+    gpu_usage = get_gpu_usage()
+    gpu_freq = get_gpu_frequency()
+    freq_str = f" {gpu_freq} MHz" if gpu_freq is not None else ""
+    progress = Progress(
+        TextColumn("Mali0"),
+        BarColumn(bar_width=None),
+        TextColumn(f"{gpu_usage:.2f}%{freq_str}"),
+        expand=True,
+    )
+    progress.add_task("", total=100, completed=gpu_usage)
+    return Panel(
+        progress,
+        title="GPU",
+        padding=(0, 1),
+        border_style="green",
+        box=box.ROUNDED,
+    )
+
+
+def build_npu_panel():
+    loads = get_npu_load()
+    if not loads:
+        return Panel("NPU not available", title="NPU", box=box.ROUNDED)
+    npu_freq = get_npu_frequency()
+
+    progress = Progress(
+        TextColumn("{task.description}"),
+        BarColumn(bar_width=None),
+        TextColumn(f"{{task.percentage:>3.0f}}% {npu_freq:>4d} MHz"),
+        expand=True,
+    )
+    for i, val in enumerate(loads):
+        progress.add_task(f"NPU Core {i}", total=100, completed=val)
+    return Panel(
+        progress,
+        title="NPU",
+        padding=(0, 1),
+        border_style="green",
+        box=box.ROUNDED,
+    )
+
+
+def build_rga_panel():
+    """Build RGA panel showing graphics accelerator load"""
+    sc, rgaload = get_rga_load()
+    if not rgaload:
+        return Panel("RGA not available", title="RGA", box=box.ROUNDED)
+    progress = Progress(
+        TextColumn("{task.description}"),
+        BarColumn(bar_width=None),
+        TextColumn("{task.percentage:>3.0f}%"),
+        expand=True,
+    )
+    sorted_items = sorted(rgaload.items())  # Sort by scheduler name
+    for name, val in sorted_items:
+        progress.add_task(name, total=100, completed=val)
+    return Panel(
+        progress,
+        title="RGA",
+        padding=(0, 1),
+        border_style="green",
+        box=box.ROUNDED,
+    )
+
+
+def build_sys_panel():
+    """Build system information panel with device name and versions"""
+    rk_model = get_rk_model()
+
+    sys_table = Table.grid(expand=True)
+    sys_table.add_column()
+    sys_table.add_column(justify="right")
+
+    npu_version = get_npu_driver_version().strip()
+    rga_version = get_rga_version().strip()
+    lib_version = get_librknnrt_version().strip()
+
+    sys_table.add_row(
+        "[bold]Rockchip SoC[/bold]",
+        f"[italic]{rk_model}[/italic]",
+    )
+    sys_table.add_row("NPU Driver", npu_version)
+    sys_table.add_row("RGA Driver", rga_version)
+    sys_table.add_row("librknnrt", lib_version)
+
+    return Panel(
+        sys_table,
+        title="SYS",
+        padding=(0, 1),
+        border_style="red",
+        box=box.ROUNDED,
+    )
+
+
+def build_cpu_panel():
+    usage = get_cpu_load()
+    freqs = get_cpu_frequencies()
+
+    table = Table.grid(expand=True)
+    table.add_column()
+
+    # render each CPU line with usage and frequency
+    for cpu_id, u in enumerate(usage):
+        freq_mhz = freqs[cpu_id] if cpu_id < len(freqs) else 0
+        progress = Progress(
+            TextColumn(f"CPU {cpu_id}"),
+            BarColumn(bar_width=None),
+            TextColumn(f"{u:>3.0f}% {freq_mhz:>4d} MHz"),
+            expand=True,
+        )
+        progress.add_task("", total=100, completed=u)
+        table.add_row(progress)
+
+    return Panel(
+        table, title="CPU", padding=(1, 2), border_style="cyan", box=box.ROUNDED
+    )
+
+
+def build_mem_panel():
+    vm, sm = get_mem_info()
+    used_plus_cached = vm.used + vm.cached
+    ram_info = f"{human_bytes(used_plus_cached)} / {human_bytes(vm.total)}"
+    swap_info = f"{human_bytes(sm.used)} / {human_bytes(sm.total)}"
+    cached = human_bytes(getattr(vm, "cached", 0))
+    shared = human_bytes(getattr(vm, "shared", 0))
+    free = human_bytes(vm.available)
+    total = human_bytes(vm.total)
+    ram_used = human_bytes(vm.used)
+    zused, ztot = 0, 0
+    with contextlib.suppress(Exception):
+        with open("/sys/block/zram0/mm_stat") as f:
+            parts = f.read().split()
+            orig = int(parts[0])
+            compr = int(parts[1])
+            used = int(parts[2])
+            limit = int(parts[3])
+            zused = used  # Uso de RAM por ZRAM
+            ztot = limit  # Límite de ZRAM
+
+    zram_info = f"{human_bytes(zused)} / {human_bytes(ztot)}"
+    zram_pct = (zused / ztot * 100) if ztot > 0 else 0
+
+    details = Table.grid(expand=True)
+    details.add_column(justify="left")
+    details.add_column(justify="center")
+    details.add_column(justify="right")
+
+    details.add_row(
+        f"[bold]Total:[/bold] {total}",
+        f"[bold]Free:[/bold] {free}",
+        f"[bold]Used:[/bold] {ram_used}",
+    )
+    details.add_row(f"[bold]Cache:[/bold] {cached}", f"[bold]Shared:[/bold] {shared}")
+
+    progress = Progress(
+        TextColumn("{task.description}"),
+        BarColumn(bar_width=None),
+        TextColumn(
+            "{task.percentage:>3.0f}% [dim]| {task.fields[info]:>16}", justify="right"
+        ),
+        expand=True,
+    )
+    progress.add_task("RAM", total=100, completed=vm.percent, info=ram_info)
+    progress.add_task("Swap", total=100, completed=sm.percent, info=swap_info)
+    progress.add_task("ZRAM", total=100, completed=zram_pct, info=zram_info)
+
+    return Panel(
+        Group(progress, details),
+        title="Memory",
+        padding=(0, 1),
+        border_style="cyan",
+        box=box.ROUNDED,
+    )
+
+
+def build_io_table():
+    """Panel with disk I/O and network traffic"""
+    global PREV_DISK, PREV_NET, PREV_TIME
+    now = time.time()
+    disk = psutil.disk_io_counters()
+    net = psutil.net_io_counters()
+    if PREV_TIME:
+        interval = now - PREV_TIME
+        read_rate = (disk.read_bytes - PREV_DISK.read_bytes) / interval
+        write_rate = (disk.write_bytes - PREV_DISK.write_bytes) / interval
+        rx_rate = (net.bytes_recv - PREV_NET.bytes_recv) / interval
+        tx_rate = (net.bytes_sent - PREV_NET.bytes_sent) / interval
+    else:
+        read_rate = write_rate = rx_rate = tx_rate = 0
+    PREV_DISK, PREV_NET, PREV_TIME = disk, net, now
+
+    # Create a table with style similar to temperature panel
+    tbl = Table(title="I/O", box=box.ROUNDED, expand=True, padding=(0, 1))
+    tbl.add_column("Metric", style="cyan")
+    tbl.add_column("Value", justify="right")
+    tbl.add_row("Read", f"{human_bytes(read_rate)}/s")
+    tbl.add_row("Write", f"{human_bytes(write_rate)}/s")
+    tbl.add_row("RX", f"{human_bytes(rx_rate)}/s")
+    tbl.add_row("TX", f"{human_bytes(tx_rate)}/s")
+
+    return tbl
+
+
+def build_thermal_table():
+    tbl = Table(title="Temperatures", box=box.ROUNDED, expand=True, padding=(0, 1))
+    tbl.add_column("Sensor", style="cyan")
+    tbl.add_column("Temp", justify="right")
+    for name, val in get_thermal():
+        tbl.add_row(name, f"{val}°C")
+    return tbl
+
+
+def build_layout():
+    left_panels = [build_cpu_panel(), build_mem_panel()]
+    right_panels = [build_sys_panel()]
+    if get_gpu_usage():
+        right_panels.append(build_gpu_panel())
+    if get_npu_load():  # NPU available
+        right_panels.append(build_npu_panel())
+    _, rga_loads = get_rga_load()
+    if rga_loads:  # RGA available
+        right_panels.append(build_rga_panel())
+    bottom_left_panels = [build_io_table(), build_thermal_table()]
+
+    top_layout = Layout()
+    top_layout.split_row(
+        Layout(Group(*left_panels), name="left"),
+        Layout(Group(*right_panels), name="right"),
+    )
+    bottom_layout = Layout()
+    bottom_layout.split_row(
+        Layout(Group(*bottom_left_panels), name="left", ratio=4),
+        Layout(build_process_panel(), name="right", ratio=15),
+    )
+    root_layout = Layout()
+    root_layout.split(
+        Layout(top_layout, name="top", minimum_size=19),
+        Layout(bottom_layout, name="bottom", ratio=1),
+    )
+    return root_layout
+
+
+def main():
+    q = queue.Queue()
+    threading.Thread(target=get_key, args=(q,), daemon=True).start()
+    old = termios.tcgetattr(sys.stdin)
+    try:
+        with Live(build_layout(), refresh_per_second=1, screen=True) as live:
+            while True:
+                time.sleep(1)
+                live.update(build_layout())
+                if not q.empty() and q.get() in ["q", "Q", "esc"]:
+                    break
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+        os.system("stty sane")
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        print("Root permissions required. Use: sudo rktop")
+        sys.exit(1)
+    main()
