@@ -200,7 +200,7 @@ def get_rga_version():
             rgaver = f.read()
         return rgaver.split(":")[1].strip()
     except Exception:
-        return "Unknown"
+        return "Not Detected"
 
 
 def get_npu_driver_version():
@@ -210,7 +210,7 @@ def get_npu_driver_version():
             rkver = f.read()
         return rkver.split(":")[1].strip()
     except Exception:
-        return "Unknown"
+        return "Not Detected"
 
 
 def get_librknnrt_version():
@@ -224,7 +224,22 @@ def get_librknnrt_version():
         ver = re.sub(r"\s*\(.*\)$", "", ver)
         return ver
     except Exception:
-        return "Unknown"
+        return "Not Detected"
+
+
+def get_librkllmrt_version():
+    """Read librkllmrt library version"""
+    try:
+        output = subprocess.check_output(
+            'strings /usr/lib/librkllmrt.so | grep "RKLLM SDK (version: "', shell=True
+        )
+        ver = output.decode("utf-8").strip()
+        match = re.search(r"version:\s*([\d.]+)", ver)
+        if match:
+            return match.group(1)
+        return "Not Detected"
+    except Exception:
+        return "Not Detected"
 
 
 def get_cpu_load():
@@ -384,6 +399,7 @@ def build_sys_panel():
     npu_version = get_npu_driver_version().strip()
     rga_version = get_rga_version().strip()
     lib_version = get_librknnrt_version().strip()
+    llm_version = get_librkllmrt_version().strip()
 
     sys_table.add_row(
         "[bold]Rockchip SoC[/bold]",
@@ -391,7 +407,8 @@ def build_sys_panel():
     )
     sys_table.add_row("NPU Driver", npu_version)
     sys_table.add_row("RGA Driver", rga_version)
-    sys_table.add_row("librknnrt", lib_version)
+    sys_table.add_row("RKNN Runtime", lib_version)
+    sys_table.add_row("RKLLM Runtime", llm_version)
 
     return Panel(
         sys_table,

@@ -12,7 +12,7 @@
 - **Thermal monitoring** - All available temperature sensors
 - **I/O statistics** - Real-time disk read/write and network RX/TX rates
 - **Process viewer** - Top 16 processes by CPU usage
-- **System information** - SoC model, driver versions (NPU, RGA, librknnrt)
+- **System information** - SoC model, driver versions (NPU, RGA, RKNN, RKLLM)
 - **Interactive UI** - Built with Rich library for beautiful terminal graphics
 
 
