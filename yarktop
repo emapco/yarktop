@@ -41,6 +41,18 @@ PREV_DISK = None
 PREV_NET = None
 PREV_TIME = None
 
+# OPTIMIZATION: Cache for static/expensive data
+CACHE = {
+    'has_gpu': None,
+    'has_npu': None,
+    'has_rga': None,
+    'rk_model': None,
+    'npu_version': None,
+    'rga_version': None,
+    'rknn_version': None,
+    'rkllm_version': None,
+}
+
 
 def get_key(q):
     old = termios.tcgetattr(sys.stdin)
@@ -177,6 +189,10 @@ def get_rk_model():
     Returns something like "RK3588" or "RK3399" if available,
     or "Unknown RK" otherwise.
     """
+    # OPTIMIZATION: Use cache
+    if CACHE['rk_model'] is not None:
+        return CACHE['rk_model']
+
     paths = ["/proc/device-tree/model", "/sys/firmware/devicetree/base/model"]
     for p in paths:
         if os.path.exists(p):
@@ -187,34 +203,50 @@ def get_rk_model():
                 # Look for something like "RKxxxx"
                 m = re.search(r"\b(RK\d+)\b", model, re.IGNORECASE)
                 if m:
-                    return m.group(1).upper()
+                    CACHE['rk_model'] = m.group(1).upper()
+                    return CACHE['rk_model']
+                CACHE['rk_model'] = model
                 return model
-    return "Unknown RK"
+    CACHE['rk_model'] = "Unknown RK"
+    return CACHE['rk_model']
 
 
 def get_rga_version():
     """Read RGA driver version"""
-    rgaver = ""
+    # OPTIMIZATION: Use cache
+    if CACHE['rga_version'] is not None:
+        return CACHE['rga_version']
+
     try:
         with open("/sys/kernel/debug/rkrga/driver_version", "r") as f:
             rgaver = f.read()
-        return rgaver.split(":")[1].strip()
+        CACHE['rga_version'] = rgaver.split(":")[1].strip()
     except Exception:
-        return "Not Detected"
+        CACHE['rga_version'] = "Not Detected"
+    return CACHE['rga_version']
 
 
 def get_npu_driver_version():
     """Read NPU kernel driver version"""
+    # OPTIMIZATION: Use cache
+    if CACHE['npu_version'] is not None:
+        return CACHE['npu_version']
+
     try:
         with open("/sys/kernel/debug/rknpu/version", "r") as f:
             rkver = f.read()
-        return rkver.split(":")[1].strip()
+        CACHE['npu_version'] = rkver.split(":")[1].strip()
     except Exception:
-        return "Not Detected"
+        CACHE['npu_version'] = "Not Detected"
+    return CACHE['npu_version']
 
 
 def get_librknnrt_version():
     """Read librknnrt library version"""
+    # OPTIMIZATION: Use cache
+    if CACHE['rknn_version'] is not None:
+        return CACHE['rknn_version']
+
     try:
         output = subprocess.check_output(
             'strings /usr/lib/librknnrt.so | grep "librknnrt version:"', shell=True
@@ -222,13 +254,18 @@ def get_librknnrt_version():
         ver = output.decode("utf-8").strip()
         ver = ver.replace("librknnrt version: ", "")
         ver = re.sub(r"\s*\(.*\)$", "", ver)
-        return ver
+        CACHE['rknn_version'] = ver
     except Exception:
-        return "Not Detected"
+        CACHE['rknn_version'] = "Not Detected"
+    return CACHE['rknn_version']
 
 
 def get_librkllmrt_version():
     """Read librkllmrt library version"""
+    # OPTIMIZATION: Use cache
+    if CACHE['rkllm_version'] is not None:
+        return CACHE['rkllm_version']
+
     try:
         output = subprocess.check_output(
             'strings /usr/lib/librkllmrt.so | grep "RKLLM SDK (version: "', shell=True
@@ -236,14 +273,17 @@ def get_librkllmrt_version():
         ver = output.decode("utf-8").strip()
         match = re.search(r"version:\s*([\d.]+)", ver)
         if match:
-            return match.group(1)
-        return "Not Detected"
+            CACHE['rkllm_version'] = match.group(1)
+        else:
+            CACHE['rkllm_version'] = "Not Detected"
     except Exception:
-        return "Not Detected"
+        CACHE['rkllm_version'] = "Not Detected"
+    return CACHE['rkllm_version']
 
 
 def get_cpu_load():
-    return psutil.cpu_percent(percpu=True)
+    # OPTIMIZATION: Use interval=0.1 instead of blocking call
+    return psutil.cpu_percent(percpu=True, interval=0.1)
 
 
 def get_mem_info():
@@ -274,20 +314,21 @@ def get_top_processes(by="cpu", count=5):
         list: List of dictionaries with process information.
     """
     processes = []
-    for proc in psutil.process_iter(attrs=["pid", "name", "username"]):
+    # OPTIMIZATION: Use cached attrs to avoid repeated lookups
+    for proc in psutil.process_iter(attrs=["pid", "name", "username", "cpu_percent", "memory_percent"]):
         try:
-            with proc.oneshot():
-                cpu = proc.cpu_percent(interval=None)
-                mem = proc.memory_percent()
-                info = {
-                    "pid": proc.pid,
-                    "name": proc.name(),
-                    "user": proc.username(),
-                    "cpu": cpu,
-                    "mem": mem,
-                }
-                processes.append(info)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            # OPTIMIZATION: Use cached info from attrs instead of proc.oneshot()
+            info = proc.info
+            if info.get('cpu_percent') is None:
+                continue
+            processes.append({
+                "pid": info['pid'],
+                "name": info['name'] or '',
+                "user": info['username'] or 'unknown',
+                "cpu": info['cpu_percent'] or 0.0,
+                "mem": info['memory_percent'] or 0.0,
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
             continue
     key = "cpu" if by == "cpu" else "mem"
     return sorted(processes, key=lambda p: p[key], reverse=True)[:count]
@@ -390,6 +431,7 @@ def build_rga_panel():
 
 def build_sys_panel():
     """Build system information panel with device name and versions"""
+    # OPTIMIZATION: All these now use cache
     rk_model = get_rk_model()
 
     sys_table = Table.grid(expand=True)
@@ -537,16 +579,33 @@ def build_thermal_table():
     return tbl
 
 
+def initialize_cache():
+    """OPTIMIZATION: Check hardware availability once at startup"""
+    CACHE['has_gpu'] = get_gpu_usage() is not None
+    CACHE['has_npu'] = len(get_npu_load()) > 0
+    _, rga_loads = get_rga_load()
+    CACHE['has_rga'] = bool(rga_loads)
+
+    # Pre-cache all versions
+    get_rk_model()
+    get_npu_driver_version()
+    get_rga_version()
+    get_librknnrt_version()
+    get_librkllmrt_version()
+
+
 def build_layout():
     left_panels = [build_cpu_panel(), build_mem_panel()]
     right_panels = [build_sys_panel()]
-    if get_gpu_usage():
+
+    # OPTIMIZATION: Use cached hardware availability
+    if CACHE['has_gpu']:
         right_panels.append(build_gpu_panel())
-    if get_npu_load():  # NPU available
+    if CACHE['has_npu']:
         right_panels.append(build_npu_panel())
-    _, rga_loads = get_rga_load()
-    if rga_loads:  # RGA available
+    if CACHE['has_rga']:
         right_panels.append(build_rga_panel())
+
     bottom_left_panels = [build_io_table(), build_thermal_table()]
 
     top_layout = Layout()
@@ -568,13 +627,18 @@ def build_layout():
 
 
 def main():
+    # OPTIMIZATION: Initialize cache once at startup
+    print("Initializing hardware detection...")
+    initialize_cache()
+
     q = queue.Queue()
     threading.Thread(target=get_key, args=(q,), daemon=True).start()
     old = termios.tcgetattr(sys.stdin)
     try:
-        with Live(build_layout(), refresh_per_second=1, screen=True) as live:
+        # OPTIMIZATION: Reduce refresh rate from 1 to 0.5 Hz (every 2 seconds)
+        with Live(build_layout(), refresh_per_second=0.5, screen=True) as live:
             while True:
-                time.sleep(1)
+                time.sleep(2)  # OPTIMIZATION: Update every 2 seconds instead of 1
                 live.update(build_layout())
                 if not q.empty() and q.get() in ["q", "Q", "esc"]:
                     break
