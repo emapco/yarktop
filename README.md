@@ -35,7 +35,7 @@ sudo pip3 install rich psutil
 
 1. **Download the script:**
    ```bash
-   wget https://raw.githubusercontent.com/manny/yarktop/main/yarktop
+   wget https://raw.githubusercontent.com/emapco/yarktop/main/yarktop
    ```
 
 2. **Make it executable:**
