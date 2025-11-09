@@ -66,6 +66,10 @@ sudo yarktop
 ### **Controls**
 
 - **`q`** or **`Q`** or **`ESC`** - Exit the application
+- **`c`** or **`C`** - Sort processes by CPU usage (toggle ascending/descending)
+- **`m`** or **`M`** - Sort processes by memory usage (toggle ascending/descending)
+- **`p`** or **`P`** - Sort processes by PID (toggle ascending/descending)
+- **`n`** or **`N`** - Sort processes by name (toggle ascending/descending)
 
 ## **🔧 Supported Hardware**
 
@@ -75,6 +79,8 @@ yarktop works on Rockchip SoC boards including:
 - Other Rockchip boards with appropriate kernel support
 
 **Note:** Some features (GPU, NPU, RGA) require specific kernel drivers and debugfs access.
+
+For detailed setup instructions, see the [Rockchip Environment Setup](https://github.com/emapco/yarktop/wiki/Rockchip-Environment-Setup) wiki page.
 
 
 ## **📋 Requirements**

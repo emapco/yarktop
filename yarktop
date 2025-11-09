@@ -21,12 +21,14 @@ import math
 import os
 import queue
 import re
+import signal
 import subprocess
 import sys
 import termios
 import threading
 import time
 import tty
+from typing import Any
 
 import psutil
 from rich import box
@@ -38,20 +40,22 @@ from rich.progress import BarColumn, Progress, TextColumn
 from rich.table import Table
 
 PREV_DISK = None
-PREV_NET = None
 PREV_TIME = None
-
-# OPTIMIZATION: Cache for static/expensive data
-CACHE = {
-    'has_gpu': None,
-    'has_npu': None,
-    'has_rga': None,
-    'rk_model': None,
-    'npu_version': None,
-    'rga_version': None,
-    'rknn_version': None,
-    'rkllm_version': None,
+PREV_ADAPTERS = {}  # Per-adapter network stats: {adapter_name: (bytes_recv, bytes_sent)}
+CACHE: dict[str, Any] = {
+    "has_gpu": None,
+    "has_npu": None,
+    "has_rga": None,
+    "sys_panel": None,
 }
+SORT_MODE = "cpu_desc"  # Default sorting mode
+SHOULD_EXIT = False  # Flag for graceful shutdown
+
+
+def signal_handler(signum, frame):
+    """Handle SIGINT (CTRL+C) for graceful exit"""
+    global SHOULD_EXIT
+    SHOULD_EXIT = True
 
 
 def get_key(q):
@@ -183,106 +187,80 @@ def get_rga_load():
     return scheduler_id, rgaload
 
 
+def get_board_name():
+    """
+    Get the full board name from device tree.
+    Returns the complete model string like "Radxa ROCK 5B" or similar.
+    """
+    paths = ["/proc/device-tree/model", "/sys/firmware/devicetree/base/model"]
+    for p in paths:
+        if os.path.exists(p):
+            with contextlib.suppress(Exception):
+                data = open(p, "rb").read().rstrip(b"\x00")
+                model = data.decode("ascii", errors="ignore").strip()
+                if model:
+                    return model
+    return "Unknown Board"
+
+
 def get_rk_model():
     """
     Detect the Rockchip SoC model by reading the device tree.
     Returns something like "RK3588" or "RK3399" if available,
     or "Unknown RK" otherwise.
     """
-    # OPTIMIZATION: Use cache
-    if CACHE['rk_model'] is not None:
-        return CACHE['rk_model']
-
-    paths = ["/proc/device-tree/model", "/sys/firmware/devicetree/base/model"]
-    for p in paths:
-        if os.path.exists(p):
-            with contextlib.suppress(Exception):
-                # The file usually contains a NUL-terminated string
-                data = open(p, "rb").read().rstrip(b"\x00")
-                model = data.decode("ascii", errors="ignore")
-                # Look for something like "RKxxxx"
-                m = re.search(r"\b(RK\d+)\b", model, re.IGNORECASE)
-                if m:
-                    CACHE['rk_model'] = m.group(1).upper()
-                    return CACHE['rk_model']
-                CACHE['rk_model'] = model
-                return model
-    CACHE['rk_model'] = "Unknown RK"
-    return CACHE['rk_model']
+    board_name = get_board_name()
+    # Look for something like "RKxxxx"
+    m = re.search(r"\b(RK\d+)\b", board_name, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    return "Unknown RK"
 
 
 def get_rga_version():
     """Read RGA driver version"""
-    # OPTIMIZATION: Use cache
-    if CACHE['rga_version'] is not None:
-        return CACHE['rga_version']
-
-    try:
+    with contextlib.suppress(Exception):
         with open("/sys/kernel/debug/rkrga/driver_version", "r") as f:
             rgaver = f.read()
-        CACHE['rga_version'] = rgaver.split(":")[1].strip()
-    except Exception:
-        CACHE['rga_version'] = "Not Detected"
-    return CACHE['rga_version']
+        return rgaver.split(":")[1].strip()
+    return "Not Detected"
 
 
 def get_npu_driver_version():
     """Read NPU kernel driver version"""
-    # OPTIMIZATION: Use cache
-    if CACHE['npu_version'] is not None:
-        return CACHE['npu_version']
-
-    try:
+    with contextlib.suppress(Exception):
         with open("/sys/kernel/debug/rknpu/version", "r") as f:
             rkver = f.read()
-        CACHE['npu_version'] = rkver.split(":")[1].strip()
-    except Exception:
-        CACHE['npu_version'] = "Not Detected"
-    return CACHE['npu_version']
+        return rkver.split(":")[1].strip()
+    return "Not Detected"
 
 
 def get_librknnrt_version():
     """Read librknnrt library version"""
-    # OPTIMIZATION: Use cache
-    if CACHE['rknn_version'] is not None:
-        return CACHE['rknn_version']
-
-    try:
+    with contextlib.suppress(Exception):
         output = subprocess.check_output(
             'strings /usr/lib/librknnrt.so | grep "librknnrt version:"', shell=True
         )
         ver = output.decode("utf-8").strip()
         ver = ver.replace("librknnrt version: ", "")
-        ver = re.sub(r"\s*\(.*\)$", "", ver)
-        CACHE['rknn_version'] = ver
-    except Exception:
-        CACHE['rknn_version'] = "Not Detected"
-    return CACHE['rknn_version']
+        return re.sub(r"\s*\(.*\)$", "", ver)
+    return "Not Detected"
 
 
 def get_librkllmrt_version():
     """Read librkllmrt library version"""
-    # OPTIMIZATION: Use cache
-    if CACHE['rkllm_version'] is not None:
-        return CACHE['rkllm_version']
-
-    try:
+    with contextlib.suppress(Exception):
         output = subprocess.check_output(
             'strings /usr/lib/librkllmrt.so | grep "RKLLM SDK (version: "', shell=True
         )
         ver = output.decode("utf-8").strip()
         match = re.search(r"version:\s*([\d.]+)", ver)
         if match:
-            CACHE['rkllm_version'] = match.group(1)
-        else:
-            CACHE['rkllm_version'] = "Not Detected"
-    except Exception:
-        CACHE['rkllm_version'] = "Not Detected"
-    return CACHE['rkllm_version']
+            return match.group(1)
+    return "Not Detected"
 
 
 def get_cpu_load():
-    # OPTIMIZATION: Use interval=0.1 instead of blocking call
     return psutil.cpu_percent(percpu=True, interval=0.1)
 
 
@@ -303,44 +281,82 @@ def get_thermal():
     return temps
 
 
-def get_top_processes(by="cpu", count=5):
-    """Obtains the top processes by CPU or memory usage.
+def get_top_processes(count=5, sort_mode="cpu_desc"):
+    """Obtains the top processes sorted by the specified mode.
 
     Args:
-        by (str, optional): 'cpu' or 'memory' to sort by. Defaults to "cpu".
         count (int, optional): number of processes to return. Defaults to 5.
+        sort_mode (str, optional): Sorting mode - one of:
+            'cpu_desc', 'cpu_asc', 'mem_desc', 'mem_asc',
+            'pid_desc', 'pid_asc', 'name_desc', 'name_asc'
+            Defaults to "cpu_desc".
 
     Returns:
         list: List of dictionaries with process information.
     """
     processes = []
-    # OPTIMIZATION: Use cached attrs to avoid repeated lookups
-    for proc in psutil.process_iter(attrs=["pid", "name", "username", "cpu_percent", "memory_percent"]):
+    for proc in psutil.process_iter(
+        attrs=["pid", "name", "username", "cpu_percent", "memory_percent"]
+    ):
         try:
-            # OPTIMIZATION: Use cached info from attrs instead of proc.oneshot()
             info = proc.info
-            if info.get('cpu_percent') is None:
+            if info.get("cpu_percent") is None:
                 continue
-            processes.append({
-                "pid": info['pid'],
-                "name": info['name'] or '',
-                "user": info['username'] or 'unknown',
-                "cpu": info['cpu_percent'] or 0.0,
-                "mem": info['memory_percent'] or 0.0,
-            })
+            processes.append(
+                {
+                    "pid": info["pid"],
+                    "name": info["name"] or "",
+                    "user": info["username"] or "unknown",
+                    "cpu": info["cpu_percent"] or 0.0,
+                    "mem": info["memory_percent"] or 0.0,
+                }
+            )
         except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
             continue
-    key = "cpu" if by == "cpu" else "mem"
-    return sorted(processes, key=lambda p: p[key], reverse=True)[:count]
+
+    # Sort based on mode
+    if sort_mode == "cpu_desc":
+        processes.sort(key=lambda p: p["cpu"], reverse=True)
+    elif sort_mode == "cpu_asc":
+        processes.sort(key=lambda p: p["cpu"], reverse=False)
+    elif sort_mode == "mem_desc":
+        processes.sort(key=lambda p: p["mem"], reverse=True)
+    elif sort_mode == "mem_asc":
+        processes.sort(key=lambda p: p["mem"], reverse=False)
+    elif sort_mode == "pid_desc":
+        processes.sort(key=lambda p: p["pid"], reverse=True)
+    elif sort_mode == "pid_asc":
+        processes.sort(key=lambda p: p["pid"], reverse=False)
+    elif sort_mode == "name_desc":
+        processes.sort(key=lambda p: p["name"].lower(), reverse=True)
+    elif sort_mode == "name_asc":
+        processes.sort(key=lambda p: p["name"].lower(), reverse=False)
+
+    return processes[:count]
 
 
 def build_process_panel():
     """
-    Build a panel showing processes with highest CPU or memory usage.
+    Build a panel showing processes with sorting controls.
     """
-    top_cpu = get_top_processes(by="cpu", count=16)
+    global SORT_MODE
 
-    table = Table(title="Top Processes", box=box.ROUNDED, expand=True, padding=(0, 1))
+    top_processes = get_top_processes(count=24, sort_mode=SORT_MODE)
+
+    # Determine current sort display
+    sort_display = {
+        "cpu_desc": "CPU↓",
+        "cpu_asc": "CPU↑",
+        "mem_desc": "Mem↓",
+        "mem_asc": "Mem↑",
+        "pid_desc": "PID↓",
+        "pid_asc": "PID↑",
+        "name_desc": "Name↓",
+        "name_asc": "Name↑",
+    }.get(SORT_MODE, "CPU↓")
+
+    title = f"Sort: [C]PU [M]em [P]ID [N]ame | Current: {sort_display} | [Q]uit"
+    table = Table(title=title, box=box.ROUNDED, expand=True, padding=(0, 1))
     table.add_column("PID", style="cyan", justify="right", width=4)
     table.add_column("User", style="white", width=6)
     table.add_column("Name", style="green", width=40)
@@ -350,7 +366,7 @@ def build_process_panel():
     def is_root(username):
         return username == "root" or username == "0"
 
-    for proc in top_cpu:
+    for proc in top_processes:
         table.add_row(
             str(proc["pid"]),
             f"[dim]{proc['user']}" if is_root(proc["user"]) else proc["user"],
@@ -431,8 +447,7 @@ def build_rga_panel():
 
 def build_sys_panel():
     """Build system information panel with device name and versions"""
-    # OPTIMIZATION: All these now use cache
-    rk_model = get_rk_model()
+    board_name = get_board_name()
 
     sys_table = Table.grid(expand=True)
     sys_table.add_column()
@@ -444,8 +459,8 @@ def build_sys_panel():
     llm_version = get_librkllmrt_version().strip()
 
     sys_table.add_row(
-        "[bold]Rockchip SoC[/bold]",
-        f"[italic]{rk_model}[/italic]",
+        "[bold]Board/SoC[/bold]",
+        f"[italic]{board_name}[/italic]",
     )
     sys_table.add_row("NPU Driver", npu_version)
     sys_table.add_row("RGA Driver", rga_version)
@@ -499,12 +514,10 @@ def build_mem_panel():
     with contextlib.suppress(Exception):
         with open("/sys/block/zram0/mm_stat") as f:
             parts = f.read().split()
-            orig = int(parts[0])
-            compr = int(parts[1])
             used = int(parts[2])
             limit = int(parts[3])
-            zused = used  # Uso de RAM por ZRAM
-            ztot = limit  # Límite de ZRAM
+            zused = used  # RAM used by ZRAM
+            ztot = limit  # ZRAM limit
 
     zram_info = f"{human_bytes(zused)} / {human_bytes(ztot)}"
     zram_pct = (zused / ztot * 100) if ztot > 0 else 0
@@ -544,28 +557,43 @@ def build_mem_panel():
 
 def build_io_table():
     """Panel with disk I/O and network traffic"""
-    global PREV_DISK, PREV_NET, PREV_TIME
+    global PREV_DISK, PREV_TIME, PREV_ADAPTERS
     now = time.time()
     disk = psutil.disk_io_counters()
-    net = psutil.net_io_counters()
+    adapters = psutil.net_io_counters(pernic=True)
+
     if PREV_TIME:
         interval = now - PREV_TIME
-        read_rate = (disk.read_bytes - PREV_DISK.read_bytes) / interval
-        write_rate = (disk.write_bytes - PREV_DISK.write_bytes) / interval
-        rx_rate = (net.bytes_recv - PREV_NET.bytes_recv) / interval
-        tx_rate = (net.bytes_sent - PREV_NET.bytes_sent) / interval
+        if interval > 0:
+            read_rate = (disk.read_bytes - PREV_DISK.read_bytes) / interval
+            write_rate = (disk.write_bytes - PREV_DISK.write_bytes) / interval
+        else:
+            read_rate = write_rate = 0
     else:
-        read_rate = write_rate = rx_rate = tx_rate = 0
-    PREV_DISK, PREV_NET, PREV_TIME = disk, net, now
+        interval = 0
+        read_rate = write_rate = 0
+    PREV_DISK, PREV_TIME = disk, now
 
-    # Create a table with style similar to temperature panel
     tbl = Table(title="I/O", box=box.ROUNDED, expand=True, padding=(0, 1))
     tbl.add_column("Metric", style="cyan")
-    tbl.add_column("Value", justify="right")
-    tbl.add_row("Read", f"{human_bytes(read_rate)}/s")
-    tbl.add_row("Write", f"{human_bytes(write_rate)}/s")
-    tbl.add_row("RX", f"{human_bytes(rx_rate)}/s")
-    tbl.add_row("TX", f"{human_bytes(tx_rate)}/s")
+    tbl.add_column("Read/RX", justify="right")
+    tbl.add_column("Write/TX", justify="right")
+
+    # Disk I/O
+    tbl.add_row("Disk", f"{human_bytes(read_rate)}/s", f"{human_bytes(write_rate)}/s")
+
+    # Per-adapter network I/O
+    for adapter_name, stats in sorted(adapters.items()):
+        if interval > 0 and adapter_name in PREV_ADAPTERS:
+            prev_rx, prev_tx = PREV_ADAPTERS[adapter_name]
+            adapter_rx_rate = (stats.bytes_recv - prev_rx) / interval
+            adapter_tx_rate = (stats.bytes_sent - prev_tx) / interval
+            tbl.add_row(
+                adapter_name,
+                f"{human_bytes(adapter_rx_rate)}/s",
+                f"{human_bytes(adapter_tx_rate)}/s",
+            )
+        PREV_ADAPTERS[adapter_name] = (stats.bytes_recv, stats.bytes_sent)
 
     return tbl
 
@@ -581,67 +609,83 @@ def build_thermal_table():
 
 def initialize_cache():
     """OPTIMIZATION: Check hardware availability once at startup"""
-    CACHE['has_gpu'] = get_gpu_usage() is not None
-    CACHE['has_npu'] = len(get_npu_load()) > 0
+    CACHE["has_gpu"] = get_gpu_usage() is not None
+    CACHE["has_npu"] = len(get_npu_load()) > 0
     _, rga_loads = get_rga_load()
-    CACHE['has_rga'] = bool(rga_loads)
-
-    # Pre-cache all versions
-    get_rk_model()
-    get_npu_driver_version()
-    get_rga_version()
-    get_librknnrt_version()
-    get_librkllmrt_version()
+    CACHE["has_rga"] = bool(rga_loads)
+    CACHE["sys_panel"] = build_sys_panel()
 
 
 def build_layout():
     left_panels = [build_cpu_panel(), build_mem_panel()]
-    right_panels = [build_sys_panel()]
-
-    # OPTIMIZATION: Use cached hardware availability
-    if CACHE['has_gpu']:
+    right_panels = [CACHE["sys_panel"]]
+    if CACHE["has_gpu"]:
         right_panels.append(build_gpu_panel())
-    if CACHE['has_npu']:
+    if CACHE["has_npu"]:
         right_panels.append(build_npu_panel())
-    if CACHE['has_rga']:
+    if CACHE["has_rga"]:
         right_panels.append(build_rga_panel())
 
     bottom_left_panels = [build_io_table(), build_thermal_table()]
 
-    top_layout = Layout()
+    top_layout = Layout(name="top", size=20, minimum_size=20)
     top_layout.split_row(
         Layout(Group(*left_panels), name="left"),
         Layout(Group(*right_panels), name="right"),
     )
-    bottom_layout = Layout()
+    bottom_layout = Layout(name="bottom")
     bottom_layout.split_row(
-        Layout(Group(*bottom_left_panels), name="left", ratio=4),
+        Layout(Group(*bottom_left_panels), name="left", ratio=6),
         Layout(build_process_panel(), name="right", ratio=15),
     )
     root_layout = Layout()
     root_layout.split(
-        Layout(top_layout, name="top", minimum_size=19),
-        Layout(bottom_layout, name="bottom", ratio=1),
+        top_layout,
+        bottom_layout,
     )
     return root_layout
 
 
 def main():
-    # OPTIMIZATION: Initialize cache once at startup
-    print("Initializing hardware detection...")
+    global SORT_MODE
     initialize_cache()
+    signal.signal(signal.SIGINT, signal_handler)  # graceful exit when CTRL+C is pressed
 
     q = queue.Queue()
     threading.Thread(target=get_key, args=(q,), daemon=True).start()
     old = termios.tcgetattr(sys.stdin)
     try:
-        # OPTIMIZATION: Reduce refresh rate from 1 to 0.5 Hz (every 2 seconds)
-        with Live(build_layout(), refresh_per_second=0.5, screen=True) as live:
-            while True:
-                time.sleep(2)  # OPTIMIZATION: Update every 2 seconds instead of 1
+        with Live(build_layout(), refresh_per_second=0.75, screen=True) as live:
+            while not SHOULD_EXIT:
+                time.sleep(1.5)
+
+                # Check for keypresses
+                if not q.empty():
+                    key = q.get()
+                    if key in ["q", "Q", "esc"]:
+                        break
+                    elif key in ["c", "C"]:
+                        if SORT_MODE == "cpu_desc":
+                            SORT_MODE = "cpu_asc"
+                        else:
+                            SORT_MODE = "cpu_desc"
+                    elif key in ["m", "M"]:
+                        if SORT_MODE == "mem_desc":
+                            SORT_MODE = "mem_asc"
+                        else:
+                            SORT_MODE = "mem_desc"
+                    elif key in ["p", "P"]:
+                        if SORT_MODE == "pid_desc":
+                            SORT_MODE = "pid_asc"
+                        else:
+                            SORT_MODE = "pid_desc"
+                    elif key in ["n", "N"]:
+                        if SORT_MODE == "name_desc":
+                            SORT_MODE = "name_asc"
+                        else:
+                            SORT_MODE = "name_desc"
+
                 live.update(build_layout())
-                if not q.empty() and q.get() in ["q", "Q", "esc"]:
-                    break
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
         os.system("stty sane")
